@@ -25,6 +25,7 @@ from timm.data import create_dataset, create_loader, resolve_data_config, RealLa
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser,\
     decay_batch_step, check_batch_size_retry
 
+
 has_apex = False
 try:
     from apex import amp
@@ -125,7 +126,9 @@ parser.add_argument('--real-labels', default='', type=str, metavar='FILENAME',
                     help='Real labels JSON file for imagenet evaluation')
 parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
                     help='Valid label indices txt file for validation of partial label space')
-parser.add_argument('--onnx_name', default='', type=str, help='whether save a onnx model')
+parser.add_argument('--engine_name', default='', type=str, help='whether save a onnx model')
+parser.add_argument('--streams', type=int, default=1, help='stream num to run the engine')
+parser.add_argument('--save_dir', type=str, default='', help='dir to save res')
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
 
@@ -191,22 +194,21 @@ def validate(args):
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
 
-    model = model.cuda()
-    if args.apex_amp:
-        model = amp.initialize(model, opt_level='O1')
+    # model = model.cuda()
+    # if args.apex_amp:
+    #     model = amp.initialize(model, opt_level='O1')
 
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
+    # if args.channels_last:
+    #     model = model.to(memory_format=torch.channels_last)
 
-    if args.num_gpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
+    # if args.num_gpu > 1:
+    #     model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    # criterion = nn.CrossEntropyLoss().cuda()
 
     dataset = create_dataset(
         root=args.data, name=args.dataset, split=args.split,
         download=args.dataset_download, load_bytes=args.tf_preprocessing, class_map=args.class_map)
-
     if args.valid_labels:
         with open(args.valid_labels, 'r') as f:
             valid_labels = {int(line.rstrip()) for line in f}
@@ -223,7 +225,7 @@ def validate(args):
     loader = create_loader(
         dataset,
         input_size=data_config['input_size'],
-        batch_size=args.batch_size,
+        batch_size=args.batch_size * args.streams,
         use_prefetcher=args.prefetcher,
         interpolation=data_config['interpolation'],
         mean=data_config['mean'],
@@ -238,71 +240,87 @@ def validate(args):
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-    model.eval()
-    with torch.no_grad():
-        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).cuda()
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
-        
-        if args.onnx_name != '':
-            import onnx
-            import onnxoptimizer
-            onnx_name = args.onnx_name + '.onnx'
-            input_names = ['input_array']
-            output_names = ['dense_out']
-            torch.onnx.export(model,
-                              input,
-                              onnx_name,
-                              input_names=input_names,
-                              output_names=output_names,
-                              opset_version=13)
-            passes = ['eliminate_identity']
-            saved_onnx_model = onnx.load(onnx_name)
-            opted_saved_onnx_model = onnxoptimizer.optimize(saved_onnx_model, passes)
-            onnx.save(opted_saved_onnx_model, onnx_name)
+    from TRTinferStream import TensorRTInferStream
+    import numpy as np
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    trt_infer = TensorRTInferStream(args.engine_name, args.streams)
+    stream_list=[cuda.Stream() for _ in range(args.streams)]
 
-        end = time.time()
-        for batch_idx, (input, target) in enumerate(loader):
-            if args.no_prefetcher:
-                target = target.cuda()
-                input = input.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
+    trt_infer.set_shape((args.batch_size,) + tuple(data_config['input_size']))
+    input = np.random.random([args.batch_size] + list(data_config['input_size'])).astype('float32')
+    output_label = np.zeros((args.batch_size * args.streams, 1000)).astype('float32')
+    for i in range(args.streams):
+        cuda.memcpy_htod(trt_infer.allocations[i][0], np.ascontiguousarray(input))
+    for i in range(args.streams):
+        trt_infer.contexts[i].execute_async_v2(trt_infer.allocations[i], stream_handle=stream_list[i].handle)
 
-            # compute output
-            with amp_autocast():
-                output = model(input)
+    for i in range(args.streams):
+        stream_list[i].synchronize()
+    for i in range(args.streams):
+        cuda.memcpy_dtoh(output_label[i], trt_infer.allocations[i][1])
+    # model.eval()
+    # with torch.no_grad():
+    #     # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
+    #     input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).cuda()
+    #     if args.channels_last:
+    #         input = input.contiguous(memory_format=torch.channels_last)
+    #     with amp_autocast():
+    #         model(input)
+    time_sum = 0.0
+    pic_num = 0
+    t1 = 0
+    t2 = 0
+    files = []
+    save_dicts = {}
+    if args.save_dir:
+        files = dataset.filenames(basename=True)
+    for batch_idx, (input, target) in enumerate(loader):
+        input = input.cpu().numpy()
+        for i in range(args.streams):
+            cuda.memcpy_htod(trt_infer.allocations[i][0], np.ascontiguousarray(input[i*args.batch_size:(i + 1)*args.batch_size, :]))
+        t1 = time.perf_counter()
+        for i in range(args.streams):
+            trt_infer.contexts[i].execute_async_v2(trt_infer.allocations[i], stream_handle=stream_list[i].handle)
+        for i in range(args.streams):
+            stream_list[i].synchronize()
+        t2 = time.perf_counter()
+        time_sum += (t2 - t1)
+        pic_num += target.size(0)
+        for i in range(args.streams):
+            cuda.memcpy_dtoh(output_label[i*args.batch_size:(i + 1)*args.batch_size, :], trt_infer.allocations[i][1])
+        output = torch.tensor(output_label).cuda()
 
-            if valid_labels is not None:
-                output = output[:, valid_labels]
-            loss = criterion(output, target)
+        if batch_idx == len(loader) - 1:
+            output = output[:target.size(0), :]
 
-            if real_labels is not None:
-                real_labels.add_result(output)
+        if valid_labels is not None:
+            output = output[:, valid_labels]
+        # loss = criterion(output, target)
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1.item(), input.size(0))
-            top5.update(acc5.item(), input.size(0))
+        if real_labels is not None:
+            real_labels.add_result(output)
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+        acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
+        top1.update(acc1.item(), target.size(0))
+        top5.update(acc5.item(), target.size(0))
 
-            if batch_idx % args.log_freq == 0:
-                _logger.info(
-                    'Test: [{0:>4d}/{1}]  '
-                    'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
-                        batch_idx, len(loader), batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
-                        loss=losses, top1=top1, top5=top5))
+        if args.save_dir:
+            if batch_idx < len(loader) - 1:
+                batch_filenames = files[batch_idx * args.batch_size * args.streams:(batch_idx+1) * args.batch_size * args.streams]
+            else:
+                batch_filenames = files[batch_idx * args.batch_size * args.streams:]
+            _, pred = output.topk(5, 1, True, True)
+            for ii in range(len(batch_filenames)):
+                save_dict = {"predict": str(pred[ii].cpu().numpy()), "target": str(target[ii].cpu().numpy())}
+                save_dicts[batch_filenames[ii]] = save_dict
+            if batch_idx == len(loader) - 1:
+                cmd = "rm -rf " + args.save_dir + " && mkdir " + args.save_dir
+                os.system(cmd)
+                save_json_file = args.save_dir + '/res.json'
+                save_data = json.dumps(save_dicts)
+                with open(save_json_file, 'w') as json_file:
+                    json_file.write(save_data)
 
     if real_labels is not None:
         # real labels mode replaces topk values at the end
@@ -310,7 +328,7 @@ def validate(args):
     else:
         top1a, top5a = top1.avg, top5.avg
     results = OrderedDict(
-        model=args.model,
+        model=args.engine_name,
         top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
         top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
         param_count=round(param_count / 1e6, 2),
@@ -321,6 +339,7 @@ def validate(args):
     _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
        results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
+    print("qps: {}".format(pic_num/time_sum)) 
     return results
 
 

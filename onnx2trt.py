@@ -25,6 +25,7 @@ from timm.data import create_dataset, create_loader, resolve_data_config, RealLa
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser,\
     decay_batch_step, check_batch_size_retry
 
+
 has_apex = False
 try:
     from apex import amp
@@ -126,9 +127,14 @@ parser.add_argument('--real-labels', default='', type=str, metavar='FILENAME',
 parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
                     help='Valid label indices txt file for validation of partial label space')
 parser.add_argument('--onnx_name', default='', type=str, help='whether save a onnx model')
+parser.add_argument('--engine_name', default='', type=str, help='whether save a onnx model')
+parser.add_argument('--pytorch_model_validation', default=False, action='store_true',
+                    help='Enable pytorch model validation')
+parser.add_argument('--cali_max_batch', default=300, type=int,
+                    metavar='N', help='Input image dimension, uses model default if empty')
+
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
-
 
 def validate(args):
     # might as well try to validate something
@@ -247,22 +253,44 @@ def validate(args):
         with amp_autocast():
             model(input)
         
-        if args.onnx_name != '':
+        onnx_name = args.onnx_name + '.onnx'
+        if args.onnx_name != '' and not os.path.exists(onnx_name):
             import onnx
             import onnxoptimizer
-            onnx_name = args.onnx_name + '.onnx'
             input_names = ['input_array']
             output_names = ['dense_out']
+            dynamic_axes = {'input_array': {0:'batch'}}
             torch.onnx.export(model,
                               input,
                               onnx_name,
                               input_names=input_names,
                               output_names=output_names,
+                              dynamic_axes=dynamic_axes,
                               opset_version=13)
             passes = ['eliminate_identity']
             saved_onnx_model = onnx.load(onnx_name)
             opted_saved_onnx_model = onnxoptimizer.optimize(saved_onnx_model, passes)
             onnx.save(opted_saved_onnx_model, onnx_name)
+
+
+  
+        engine_path = args.engine_name + '.trt'
+        if args.engine_name != '' and not os.path.exists(engine_path):
+            from calibrator import EntropyCalibrator
+            from build_engine import build_int8_engine
+            calib_data_path = 'calibration_data/'
+            calibration_cache = 'calibration_data/calibration.cache'
+            print(calibration_cache)
+            if not os.path.exists(calib_data_path):
+                os.mkdir(calib_data_path)
+            calibrator = EntropyCalibrator(calib_folder_path=calib_data_path, cache_file=calibration_cache, data_loader=loader, cali_max_batch=args.cali_max_batch, batch_size=args.batch_size)
+            with build_int8_engine(onnx_name, calibrator, args.batch_size, calibration_cache) as engine, open(engine_path, "wb") as f:
+                print("Serializing engine to file: {:}".format(engine_path))
+                f.write(engine.serialize())        
+                print('finished!!!')
+
+        if not args.pytorch_model_validation:
+            exit(0)
 
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):

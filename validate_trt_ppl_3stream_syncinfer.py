@@ -25,6 +25,7 @@ from timm.data import create_dataset, create_loader, resolve_data_config, RealLa
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser,\
     decay_batch_step, check_batch_size_retry
 
+
 has_apex = False
 try:
     from apex import amp
@@ -125,9 +126,11 @@ parser.add_argument('--real-labels', default='', type=str, metavar='FILENAME',
                     help='Real labels JSON file for imagenet evaluation')
 parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
                     help='Valid label indices txt file for validation of partial label space')
-parser.add_argument('--onnx_name', default='', type=str, help='whether save a onnx model')
+parser.add_argument('--engine_name', default='', type=str, help='whether save a onnx model')
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
+parser.add_argument('--acc', default=False, action='store_true', help='acc')
+parser.add_argument('--tested_batch_times', default=-1, type=int, help='engine name')
 
 
 def validate(args):
@@ -191,17 +194,17 @@ def validate(args):
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
 
-    model = model.cuda()
-    if args.apex_amp:
-        model = amp.initialize(model, opt_level='O1')
+    # model = model.cuda()
+    # if args.apex_amp:
+    #     model = amp.initialize(model, opt_level='O1')
 
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
+    # if args.channels_last:
+    #     model = model.to(memory_format=torch.channels_last)
 
-    if args.num_gpu > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
+    # if args.num_gpu > 1:
+    #     model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    # criterion = nn.CrossEntropyLoss().cuda()
 
     dataset = create_dataset(
         root=args.data, name=args.dataset, split=args.split,
@@ -238,88 +241,133 @@ def validate(args):
     top1 = AverageMeter()
     top5 = AverageMeter()
 
-    model.eval()
-    with torch.no_grad():
-        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).cuda()
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
+    from TRTinfer import TensorRTInfer
+    import numpy as np
+    import tensorrt as trt
+
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+
+    stream_i = cuda.Stream()
+    stream_o = cuda.Stream()
+    trt_infer = TensorRTInfer(args.engine_name)
+    trt_infer.set_bind_shape((args.batch_size, 3, 288, 288))
+    trt_infer.set_bind_shape_pp()
+    input = np.random.rand(args.batch_size, 3, 288, 288).astype('float32')
+    labels = np.zeros((args.batch_size, 1000)).astype('float32')
+
+    cuda.memcpy_htod_async(trt_infer.allocations_pp[0][0], np.ascontiguousarray(input), stream_i)
+    stream_i.synchronize()
+
+    trt_infer.context.execute_v2(trt_infer.allocations_pp[0])
+    
+    cuda.memcpy_dtoh_async(labels, trt_infer.allocations_pp[0][1], stream_o)
+    stream_o.synchronize()
+    
+    start = 0
+    time_consum = 0
+    img_num = 0
+    time_eval_1 = 0
+    time_eval_2 = 0
+    time_eval = 0
+    target_torch = [torch.zeros([args.batch_size], device='cuda:0'), torch.zeros([args.batch_size], device='cuda:0'), torch.zeros([args.batch_size], device='cuda:0')]
+    perf_flag = True
+    for batch_idx, (input, target) in enumerate(loader):
+        feed = np.ascontiguousarray(input.cpu().numpy())
+
+        if batch_idx == 0:
+            cuda.memcpy_htod_async(trt_infer.allocations_pp[0][0], feed, stream_i) # load next
         
-        if args.onnx_name != '':
-            import onnx
-            import onnxoptimizer
-            onnx_name = args.onnx_name + '.onnx'
-            input_names = ['input_array']
-            output_names = ['dense_out']
-            torch.onnx.export(model,
-                              input,
-                              onnx_name,
-                              input_names=input_names,
-                              output_names=output_names,
-                              opset_version=13)
-            passes = ['eliminate_identity']
-            saved_onnx_model = onnx.load(onnx_name)
-            opted_saved_onnx_model = onnxoptimizer.optimize(saved_onnx_model, passes)
-            onnx.save(opted_saved_onnx_model, onnx_name)
+        if batch_idx == 1:
+            stream_i.synchronize()
+            if args.acc:
+                target_torch[1] = target
+            cuda.memcpy_htod_async(trt_infer.allocations_pp[1][0], feed, stream_i) # load next
+            trt_infer.context.execute_v2(trt_infer.allocations_pp[0]) # compute current
+            continue
 
-        end = time.time()
-        for batch_idx, (input, target) in enumerate(loader):
-            if args.no_prefetcher:
-                target = target.cuda()
-                input = input.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
+        if batch_idx > 1 and batch_idx < len(loader) - 2:
+            #time
+            if batch_idx > 50 and batch_idx < len(loader)-50:
+                start = time.time()
+            #time 
+            stream_i.synchronize()
+          
+            # pre-pre-pre labels can be fetched here:......
+            if batch_idx>2:
+                stream_o.synchronize()
+                time_eval_1 = time.time()
+                if args.acc:
+                    pred = torch.from_numpy(labels).cuda()
+                    acc1, acc5 = accuracy(pred.detach(), target_torch[0], topk=(1, 5))
+                    top1.update(acc1.item(), target.size(0))
+                    top5.update(acc5.item(), target.size(0))
+                    target_torch[0] = target_torch[1]
+                    target_torch[1] = target_torch[2]
+                    target_torch[2] = target
+                    # print(acc1, acc5)
+                time_eval_2 = time.time()
 
-            # compute output
-            with amp_autocast():
-                output = model(input)
+            cuda.memcpy_dtoh_async(labels, trt_infer.allocations_pp[batch_idx%2][1], stream_o) # store pre 
+            cuda.memcpy_htod_async(trt_infer.allocations_pp[batch_idx%2][0], feed, stream_i) # load next
+            trt_infer.context.execute_v2(trt_infer.allocations_pp[(batch_idx - 1)%2]) # compute current
+      
+            #time
+            if batch_idx > 50 and batch_idx < len(loader)-50:
+                time_consum += time.time() - start - time_eval_2 + time_eval_1
+                img_num += args.batch_size
+            #time
 
-            if valid_labels is not None:
-                output = output[:, valid_labels]
-            loss = criterion(output, target)
+       
+        if args.tested_batch_times > 2 and batch_idx > args.tested_batch_times:
+            break
 
-            if real_labels is not None:
-                real_labels.add_result(output)
+    batch_idx += 1
+    stream_i.synchronize()
+    stream_o.synchronize()
+    # last three labels can be fetched here:......
+    if args.acc:
+        pred = torch.from_numpy(labels).cuda()
+        acc1, acc5 = accuracy(pred.detach(), target_torch[0], topk=(1, 5))
+        top1.update(acc1.item(), target.size(0))
+        top5.update(acc5.item(), target.size(0))
+        # print(acc1, acc5)
+    cuda.memcpy_dtoh_async(labels, trt_infer.allocations_pp[batch_idx%2][1], stream_o) # store pre 
+    trt_infer.context.execute_v2(trt_infer.allocations_pp[(batch_idx - 1)%2]) # compute current
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1.item(), input.size(0))
-            top5.update(acc5.item(), input.size(0))
+    batch_idx += 1
+   
+    stream_o.synchronize()
+    # last two labels can be fetched here:......
+    if args.acc:
+        pred = torch.from_numpy(labels).cuda()
+        acc1, acc5 = accuracy(pred.detach(), target_torch[1], topk=(1, 5))
+        top1.update(acc1.item(), target.size(0))
+        top5.update(acc5.item(), target.size(0))
+        # print(acc1, acc5)
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+    cuda.memcpy_dtoh(labels, trt_infer.allocations_pp[batch_idx%2][1]) # store pre 
+    # last can be fetched here:......
+    if args.acc:
+        pred = torch.from_numpy(labels).cuda()
+        acc1, acc5 = accuracy(pred.detach(), target_torch[2], topk=(1, 5))
+        top1.update(acc1.item(), target.size(0))
+        top5.update(acc5.item(), target.size(0))
+        # print(acc1, acc5)
 
-            if batch_idx % args.log_freq == 0:
-                _logger.info(
-                    'Test: [{0:>4d}/{1}]  '
-                    'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
-                        batch_idx, len(loader), batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
-                        loss=losses, top1=top1, top5=top5))
-
-    if real_labels is not None:
-        # real labels mode replaces topk values at the end
-        top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
-    else:
-        top1a, top5a = top1.avg, top5.avg
+    print("qps: {}/s".format(img_num/time_consum))
+    top1a, top5a = top1.avg, top5.avg
     results = OrderedDict(
-        model=args.model,
+        model=args.engine_name,
         top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
         top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
         param_count=round(param_count / 1e6, 2),
         img_size=data_config['input_size'][-1],
         crop_pct=crop_pct,
         interpolation=data_config['interpolation'])
-
-    _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    if args.acc:
+        _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
+           results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
     return results
 
